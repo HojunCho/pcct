@@ -1,0 +1,2 @@
+# CUDA_VISIBLE_DEVICES=[cuda_device_ids] python -m torch.distributed.launch --nproc_per_node=[n_gpus] train.py [--train_options] 
+CUDA_VISIBLE_DEVICES=2,4 python -m torch.distributed.launch --nproc_per_node=2 train.py --name full-softmax
