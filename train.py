@@ -71,7 +71,6 @@ for epoch in range(args.num_epochs):
     model.train()
     for input_points, cluster_ids, labels in loader:
         input_points, cluster_ids, labels = input_points.cuda(non_blocking=True), cluster_ids.cuda(non_blocking=True), labels.cuda(non_blocking=True)
-        # input_points = (input_points - input_points.mean(dim=1, keepdim=True)) / input_points.std(dim=1, keepdim=True)
         outputs = model(input_points, cluster_ids, labels=labels)
         loss = outputs.loss / accumulation
 
@@ -119,7 +118,6 @@ for epoch in range(args.num_epochs):
 
     for input_points, cluster_ids, labels in loader_test:
         input_points, cluster_ids, labels = input_points.cuda(non_blocking=True), cluster_ids.cuda(non_blocking=True), labels.cuda(non_blocking=True)
-        # input_points = (input_points - input_points.mean(dim=1, keepdim=True)) / input_points.std(dim=1, keepdim=True)
 
         with torch.no_grad():
             outputs = model(input_points, cluster_ids, labels=labels)
