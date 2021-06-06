@@ -5,6 +5,8 @@ import h5py
 import numpy as np
 from torch.utils.data import Dataset
 
+from sklearn.cluster import MiniBatchKMeans
+
 def download():
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -24,7 +26,7 @@ def load_data(partition):
     all_data = []
     all_label = []
     for h5_name in glob.glob(os.path.join(DATA_DIR, 'modelnet40_ply_hdf5_2048', 'ply_data_%s*.h5'%partition)):
-        f = h5py.File(h5_name)
+        f = h5py.File(h5_name, mode='r')
         data = f['data'][:].astype('float32')
         label = f['label'][:].astype('int64')
         f.close()
@@ -70,20 +72,33 @@ class ModelNet40(Dataset):
     @property
     def max_point(self):
         return len(self.data[0])
-
+    
     def __getitem__(self, item):
         pointcloud = self.data[item][:self.num_points]
         label = self.label[item]
         if self.partition == 'train':
-            pointcloud = random_point_dropout(pointcloud) # open for dgcnn not for our idea  for all
-            pointcloud = translate_pointcloud(pointcloud)
+            # pointcloud = random_point_dropout(pointcloud) # open for dgcnn not for our idea  for all
+            # pointcloud = translate_pointcloud(pointcloud)
             np.random.shuffle(pointcloud)
         return pointcloud, label
 
     def __len__(self):
         return self.data.shape[0]
 
+class ClusteredModelNet40(ModelNet40):
+    def __init__(self, num_points, partition='train', num_cluster=16):
+        super().__init__(num_points, partition)
+        self.num_cluster = num_cluster
+    
+    def __getitem__(self, item):
+        pointcloud, label = super().__getitem__(item)
+
+        model = MiniBatchKMeans(n_clusters=self.num_cluster, batch_size=64, max_iter=10).fit(pointcloud)
+
+        return pointcloud, model.labels_, label
+
 if __name__ == '__main__':
     train = ModelNet40(1024)
     test = ModelNet40(1024, 'test')
-    print(test.label_num, test.max_point)
+    print(len(train), train.num_labels, train.max_point)
+    print(len(test), train.num_labels, train.max_point)

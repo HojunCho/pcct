@@ -29,17 +29,18 @@ class PclConfig(PretrainedConfig):
 
     def __init__(
         self,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
+        hidden_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        intermediate_size=1024,
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
-        layer_norm_eps=1e-12,
+        batch_norm_eps=1e-12,
         pad_token_id=0,
-        global_attention=64,
+        global_attention=16,
+        chunk_size=64,
         gradient_checkpointing=False,
         **kwargs
     ):
@@ -53,8 +54,11 @@ class PclConfig(PretrainedConfig):
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.initializer_range = initializer_range
-        self.layer_norm_eps = layer_norm_eps
+        self.batch_norm_eps = batch_norm_eps
+
         self.global_attention = global_attention
+        self.chunk_size = chunk_size
+
         self.gradient_checkpointing = gradient_checkpointing
 
 class PclEmbeddings(nn.Module):
@@ -65,7 +69,7 @@ class PclEmbeddings(nn.Module):
 
         self.rbf = RBF(3, config.hidden_size)
 
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.batch_norm = nn.BatchNorm1d(config.hidden_size, eps=config.batch_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
 
@@ -76,7 +80,7 @@ class PclEmbeddings(nn.Module):
 
         embeddings = self.rbf(input_points.flatten(end_dim=1)).reshape(batch_size, num_points, -1)
         embeddings = torch.cat([self.global_embedding[None, ...].expand(batch_size, -1, -1), embeddings], dim=1)
-        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.batch_norm(embeddings.transpose(-1, -2)).transpose(-1, -2)
         embeddings = self.dropout(embeddings)
         return embeddings
 
@@ -89,15 +93,17 @@ class PclSelfAttention(nn.Module):
                 f"heads ({config.num_attention_heads})"
             )
 
+        self.global_attention = config.global_attention
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.chunk_size = config.chunk_size
 
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        # self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -107,27 +113,57 @@ class PclSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states,
+        cluster_ids,
         output_attentions=False,
     ):
-        mixed_query_layer = self.query(hidden_states)
-
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = self.transpose_for_scores(self.query(hidden_states))
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        global_key_layer, local_key_layer = key_layer[:, :, :self.global_attention, ...], key_layer[:, :, self.global_attention:, ...]
+        global_value_layer, local_value_layer = value_layer[:, :, :self.global_attention, ...], value_layer[:, :, self.global_attention:, ...]
+        global_query_layer, local_query_layer = query_layer[:, :, :self.global_attention, ...], query_layer[:, :, self.global_attention:, ...]
 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
+        # Calculate global context
+        global_attention_scores = global_query_layer @ key_layer.transpose(-1, -2)
+        global_attention_scores = global_attention_scores / math.sqrt(self.attention_head_size)
+        global_attention_probs = global_attention_scores.softmax(-1)
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
+        # global_attention_probs = self.dropout(global_attention_probs)
+        global_context_layer = global_attention_probs @ value_layer
 
+        # Calculate local context
+        B, _, P, _ = local_query_layer.shape
+        local_query_layer = local_query_layer.reshape(B, self.num_attention_heads, P // self.chunk_size, self.chunk_size, self.attention_head_size)
+        local_key_layer = local_key_layer.reshape(B, self.num_attention_heads, P // self.chunk_size, self.chunk_size, self.attention_head_size)
+        local_key_layer = torch.cat([global_key_layer[:, :, None, :, :].expand(-1, -1, P // self.chunk_size, -1, -1),
+                                     local_key_layer.roll(-1, 2), local_key_layer], dim=-2)
+        local_attention_scores = local_query_layer @ local_key_layer.transpose(-1, -2)
+        local_attention_scores = local_attention_scores / math.sqrt(self.attention_head_size)
+
+        query_cluster_ids = cluster_ids.reshape(B, P // self.chunk_size, self.chunk_size)
+        key_cluster_ids = torch.cat([query_cluster_ids.roll(-1, 1), query_cluster_ids], dim=-1)
+        attention_mask = query_cluster_ids[..., None] != key_cluster_ids[..., None, :]
+        local_attention_scores[..., self.global_attention:].masked_fill_(attention_mask[:, None, ...], -float('inf'))
+
+        local_attention_probs = local_attention_scores.softmax(-1)
+        # local_attention_probs = self.dropout(local_attention_probs)
+
+        local_value_layer = local_value_layer.reshape(B, self.num_attention_heads, P // self.chunk_size, self.chunk_size, self.attention_head_size)
+        local_value_layer = torch.cat([global_value_layer[:, :, None, :, :].expand(-1, -1, P // self.chunk_size, -1, -1),
+                                       local_value_layer.roll(-1, 2), local_value_layer], dim=-2)
+        local_context_layer = local_attention_probs @ local_value_layer
+        local_context_layer = local_context_layer.flatten(start_dim=2, end_dim=3)
+        context_layer = torch.cat([global_context_layer, local_context_layer], dim=-2)
+
+        """
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        attention_probs = self.dropout(attention_probs)
         context_layer = torch.matmul(attention_probs, value_layer)
+        """
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -140,13 +176,13 @@ class PclSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.batch_norm = nn.BatchNorm1d(config.hidden_size, eps=config.batch_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.batch_norm((hidden_states + input_tensor).transpose(-1, -2)).transpose(-1, -2)
         return hidden_states
 
 class PclAttention(nn.Module):
@@ -177,10 +213,12 @@ class PclAttention(nn.Module):
     def forward(
         self,
         hidden_states,
+        cluster_ids,
         output_attentions=False,
     ):
         self_outputs = self.self(
             hidden_states,
+            cluster_ids,
             output_attentions,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
@@ -205,13 +243,13 @@ class PclOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.batch_norm = nn.BatchNorm1d(config.hidden_size, eps=config.batch_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        hidden_states = self.batch_norm((hidden_states + input_tensor).transpose(-1, -2)).transpose(-1, -2)
         return hidden_states
 
 class PclLayer(nn.Module):
@@ -226,11 +264,13 @@ class PclLayer(nn.Module):
     def forward(
         self,
         hidden_states,
+        cluster_ids,
         output_attentions=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attention_outputs = self.attention(
             hidden_states,
+            cluster_ids,
             output_attentions=output_attentions,
         )
         attention_output = self_attention_outputs[0]
@@ -258,6 +298,7 @@ class PclEncoder(nn.Module):
     def forward(
         self,
         hidden_states,
+        cluster_ids,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
@@ -272,17 +313,19 @@ class PclEncoder(nn.Module):
             if getattr(self.config, "gradient_checkpointing", False) and self.training:
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
+                        return module(*inputs, output_attentions)
 
                     return custom_forward
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
                     hidden_states,
+                    cluster_ids,
                 )
             else:
                 layer_outputs = layer_module(
                     hidden_states,
+                    cluster_ids,
                     output_attentions,
                 )
 
@@ -312,14 +355,18 @@ class PclEncoder(nn.Module):
 class PclPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
+        self.dense = nn.Linear(config.hidden_size * config.num_hidden_layers, config.hidden_size)
+        self.activation = nn.ReLU()
+        self.global_attention = config.global_attention
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
+        """
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
+        """
+        pooled_output = self.dense(hidden_states[:, self.global_attention:,:].max(1)[0])
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -340,7 +387,7 @@ class PclPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, nn.BatchNorm1d):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
@@ -404,10 +451,14 @@ class PclModel(PclPreTrainedModel):
     def forward(
         self,
         input_points,
+        cluster_ids,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
     ):
+        cluster_ids, indices = torch.sort(cluster_ids, dim=-1)
+        input_points = torch.gather(input_points, dim=1, index=indices[..., None].expand(-1, -1, 3))
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -425,12 +476,14 @@ class PclModel(PclPreTrainedModel):
 
         encoder_outputs = self.encoder(
             embedding_output,
+            cluster_ids,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=return_dict,
         )
+        point_feature_output = torch.cat(encoder_outputs[1][1:], dim=-1)
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+        pooled_output = self.pooler(point_feature_output) if self.pooler is not None else None
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
@@ -457,6 +510,7 @@ class PclForClassification(PclPreTrainedModel):
     def forward(
         self,
         input_points=None,
+        cluster_ids=None,
         labels=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -472,6 +526,7 @@ class PclForClassification(PclPreTrainedModel):
 
         outputs = self.pcl(
             input_points,
+            cluster_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
